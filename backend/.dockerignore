@@ -1,0 +1,21 @@
+# Never copy these into the Docker image
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+*.egg-info/
+
+# Development files
+.env
+.env.local
+.gitignore
+
+# IDE
+.idea/
+.vscode/

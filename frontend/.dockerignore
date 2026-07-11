@@ -1,0 +1,20 @@
+# Node
+node_modules/
+npm-debug.log*
+
+# Vite
+*.local
+
+# Build output — intentionally NOT ignored so Docker can COPY dist/
+# dist/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
