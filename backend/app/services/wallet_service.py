@@ -1,10 +1,7 @@
 """
-Wallet Service — all wallet business logic.
-
-Transfer fix: removed begin_nested() savepoint pattern which caused
-"Can't operate on closed transaction" errors in SQLAlchemy 2.0 async.
-All operations now happen in the single session-level transaction managed
-by get_db(), committed once at the end.
+Wallet Service with real-time SSE event publishing.
+After every balance-changing operation, an event is published to Redis pub/sub
+so connected SSE clients get instant UI updates without polling.
 """
 import json
 import math
@@ -37,6 +34,7 @@ from app.schemas.wallet import (
     WalletResponse,
 )
 from app.services.exchange_rate_service import ExchangeRateService
+from app.utils.events import publish_wallet_event, publish_transfer_event
 
 logger = structlog.get_logger(__name__)
 
@@ -50,7 +48,7 @@ class WalletService:
         self.idempotency_repo = IdempotencyRepository(db)
         self.rate_service = ExchangeRateService(db)
 
-    # ── Create Wallet ─────────────────────────────────────────────────────────
+    # ── Create Wallet ──────────────────────────────────────────────────────────
 
     async def create_wallet(
         self, owner_id: uuid.UUID, request: WalletCreateRequest
@@ -68,16 +66,16 @@ class WalletService:
         )
         await self.db.commit()
         await self.db.refresh(wallet)
-        logger.info("wallet_created", wallet_id=str(wallet.id), currency=wallet.currency)
+        logger.info("wallet_created", wallet_id=str(wallet.id))
         return WalletResponse.model_validate(wallet)
 
-    # ── List Wallets ──────────────────────────────────────────────────────────
+    # ── List Wallets ───────────────────────────────────────────────────────────
 
     async def get_user_wallets(self, owner_id: uuid.UUID) -> list[WalletResponse]:
         wallets = await self.wallet_repo.get_user_wallets(owner_id)
         return [WalletResponse.model_validate(w) for w in wallets]
 
-    # ── Credit ────────────────────────────────────────────────────────────────
+    # ── Credit ─────────────────────────────────────────────────────────────────
 
     async def credit_wallet(
         self, wallet_id: uuid.UUID, owner_id: uuid.UUID, request: WalletCreditRequest
@@ -106,10 +104,22 @@ class WalletService:
 
         await self.db.commit()
         await self.db.refresh(wallet)
+
+        # Publish SSE event AFTER commit so balance is persisted
+        await publish_wallet_event(
+            user_id=owner_id,
+            event_type="credit",
+            wallet_id=wallet.id,
+            currency=wallet.currency,
+            new_balance=wallet.balance,
+            amount=request.amount,
+            transaction_type="credit",
+        )
+
         logger.info("wallet_credited", wallet_id=str(wallet_id), amount=str(request.amount))
         return WalletResponse.model_validate(wallet)
 
-    # ── Debit ─────────────────────────────────────────────────────────────────
+    # ── Debit ──────────────────────────────────────────────────────────────────
 
     async def debit_wallet(
         self, wallet_id: uuid.UUID, owner_id: uuid.UUID, request: WalletDebitRequest
@@ -142,10 +152,21 @@ class WalletService:
 
         await self.db.commit()
         await self.db.refresh(wallet)
+
+        await publish_wallet_event(
+            user_id=owner_id,
+            event_type="debit",
+            wallet_id=wallet.id,
+            currency=wallet.currency,
+            new_balance=wallet.balance,
+            amount=request.amount,
+            transaction_type="debit",
+        )
+
         logger.info("wallet_debited", wallet_id=str(wallet_id), amount=str(request.amount))
         return WalletResponse.model_validate(wallet)
 
-    # ── Transfer ──────────────────────────────────────────────────────────────
+    # ── Transfer ───────────────────────────────────────────────────────────────
 
     async def transfer(
         self,
@@ -153,23 +174,13 @@ class WalletService:
         request: TransferRequest,
         idempotency_key: str | None = None,
     ) -> TransferResponse:
-        """
-        Atomic transfer between two wallets.
-
-        Locking order: always lock the wallet with the lower UUID first.
-        This prevents deadlocks when two concurrent transfers involve the same pair.
-
-        Exchange rate is fetched BEFORE acquiring locks to avoid holding
-        a DB lock while making an external HTTP call.
-        """
-
         # ── 1. Idempotency ────────────────────────────────────────────────────
         if idempotency_key:
             existing = await self.idempotency_repo.get_by_key(idempotency_key)
             if existing:
                 raise DuplicateTransactionException(idempotency_key)
 
-        # ── 2. Validate sender owns the sender wallet ─────────────────────────
+        # ── 2. Validate sender wallet ownership ───────────────────────────────
         sender_wallet_peek = await self.wallet_repo.get_by_id(request.sender_wallet_id)
         if not sender_wallet_peek:
             raise NotFoundException("Sender wallet", str(request.sender_wallet_id))
@@ -188,6 +199,9 @@ class WalletService:
         if recipient_peek.status != WalletStatus.ACTIVE:
             raise WalletSuspendedException(str(request.recipient_wallet_id))
 
+        # Store recipient's owner ID for SSE publishing after commit
+        recipient_owner_id = recipient_peek.owner_id
+
         # ── 4. Fetch exchange rate BEFORE locking ─────────────────────────────
         exchange_rate: Decimal | None = None
         converted_amount = request.amount
@@ -201,21 +215,13 @@ class WalletService:
                 converted_amount = (request.amount * exchange_rate).quantize(
                     Decimal("0.00000001")
                 )
-                logger.info(
-                    "cross_currency_transfer",
-                    from_currency=sender_wallet_peek.currency,
-                    to_currency=recipient_peek.currency,
-                    rate=str(exchange_rate),
-                )
             except Exception as exc:
                 raise ExchangeRateUnavailableException(
                     sender_wallet_peek.currency, recipient_peek.currency
                 ) from exc
 
-        # ── 5. Acquire row locks (lower UUID first = deadlock prevention) ─────
-        id_a, id_b = sorted(
-            [request.sender_wallet_id, request.recipient_wallet_id]
-        )
+        # ── 5. Lock both wallets (lower UUID first — deadlock prevention) ─────
+        id_a, id_b = sorted([request.sender_wallet_id, request.recipient_wallet_id])
         locked_a = await self.wallet_repo.get_by_id_with_lock(id_a)
         locked_b = await self.wallet_repo.get_by_id_with_lock(id_b)
 
@@ -287,20 +293,32 @@ class WalletService:
                 response_body=json.dumps({"transfer_id": str(transfer.id)}),
             )
 
-        # ── 11. Single commit — atomic ────────────────────────────────────────
+        # ── 11. Single atomic commit ──────────────────────────────────────────
         await self.db.commit()
         await self.db.refresh(transfer)
 
-        logger.info(
-            "transfer_completed",
-            ref=ref,
-            sender=str(sender_wallet.id),
-            recipient=str(recipient_wallet.id),
-            amount=str(request.amount),
+        # ── 12. Publish SSE events to both sender and recipient ───────────────
+        # Done AFTER commit so the DB is consistent before clients refetch
+        await publish_transfer_event(
+            sender_id=sender_id,
+            recipient_id=recipient_owner_id,
+            sender_wallet_id=sender_wallet.id,
+            recipient_wallet_id=recipient_wallet.id,
+            sender_currency=sender_wallet.currency,
+            recipient_currency=recipient_wallet.currency,
+            sender_new_balance=sender_after,
+            recipient_new_balance=recipient_after,
+            amount=request.amount,
+            converted_amount=converted_amount,
+            exchange_rate=exchange_rate,
+            reference=ref,
+            note=request.note,
         )
+
+        logger.info("transfer_completed", ref=ref, sender=str(sender_wallet.id))
         return TransferResponse.model_validate(transfer)
 
-    # ── Transaction History ───────────────────────────────────────────────────
+    # ── Transaction History ────────────────────────────────────────────────────
 
     async def get_transaction_history(
         self,
