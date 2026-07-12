@@ -8,12 +8,12 @@ on:
 
 env:
   PYTHON_VERSION: "3.12"
-  DATABASE_URL: postgresql+asyncpg://test_user:test_pass@localhost:5432/test_db
-  REDIS_URL: redis://localhost:6379/0
-  JWT_SECRET_KEY: ci-test-secret-key-not-for-production
-  ENVIRONMENT: test
+  DATABASE_URL: "postgresql+asyncpg://test_user:test_pass@localhost:5432/test_db"
+  REDIS_URL: "redis://localhost:6379/0"
+  JWT_SECRET_KEY: "ci-test-secret-key-not-for-production"
+  ENVIRONMENT: "test"
   DEBUG: "true"
-  EXCHANGE_RATE_PROVIDER: mock
+  EXCHANGE_RATE_PROVIDER: "mock"
 
 jobs:
   # ── Lint ────────────────────────────────────────────────────────────────────
@@ -70,11 +70,11 @@ jobs:
             --cov-report=term-missing \
             -v
         env:
-          DATABASE_URL: sqlite+aiosqlite:///:memory:
-          REDIS_URL: redis://localhost:6379/0
-          JWT_SECRET_KEY: ${{ env.JWT_SECRET_KEY }}
-          ENVIRONMENT: test
-          EXCHANGE_RATE_PROVIDER: mock
+          DATABASE_URL: "sqlite+aiosqlite:///:memory:"
+          REDIS_URL: "redis://localhost:6379/0"
+          JWT_SECRET_KEY: "ci-test-secret-key-not-for-production"
+          ENVIRONMENT: "test"
+          EXCHANGE_RATE_PROVIDER: "mock"
 
       - name: Upload coverage report
         uses: codecov/codecov-action@v4
@@ -131,7 +131,7 @@ jobs:
       - name: Run Alembic migrations
         run: alembic upgrade head
         env:
-          DATABASE_URL: ${{ env.DATABASE_URL }}
+          DATABASE_URL: "${{ env.DATABASE_URL }}"
 
       - name: Run integration tests
         run: |
@@ -140,11 +140,11 @@ jobs:
             --cov-report=term-missing \
             -v
         env:
-          DATABASE_URL: ${{ env.DATABASE_URL }}
-          REDIS_URL: ${{ env.REDIS_URL }}
-          JWT_SECRET_KEY: ${{ env.JWT_SECRET_KEY }}
-          ENVIRONMENT: test
-          EXCHANGE_RATE_PROVIDER: mock
+          DATABASE_URL: "${{ env.DATABASE_URL }}"
+          REDIS_URL: "${{ env.REDIS_URL }}"
+          JWT_SECRET_KEY: "${{ env.JWT_SECRET_KEY }}"
+          ENVIRONMENT: "test"
+          EXCHANGE_RATE_PROVIDER: "mock"
 
   # ── Deploy to EC2 ────────────────────────────────────────────────────────────
   # Triggered only on push to main — not on PRs
