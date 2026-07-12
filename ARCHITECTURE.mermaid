@@ -1,0 +1,137 @@
+---
+title: Multi-Currency Wallet Platform — System Architecture
+---
+graph TB
+    %% ── External Users ────────────────────────────────────────────────────
+    USER(["👤 User\n(Browser / Mobile)"])
+
+    %% ── Frontend ──────────────────────────────────────────────────────────
+    subgraph FE["🖥️  Frontend  (React + Vite + Redux Toolkit)"]
+        direction TB
+        PAGES["Pages\nLogin · Register · Dashboard"]
+        REDUX["Redux Store\nauthSlice · walletSlice"]
+        AXIOS["Axios Client\nJWT Interceptor · Auto Refresh"]
+        SSE_CLIENT["EventSource\nSSE Hook (useWalletSSE)"]
+    end
+
+    %% ── Nginx ─────────────────────────────────────────────────────────────
+    NGINX["⚙️  Nginx\nReverse Proxy + Static Files\nPort 3000"]
+
+    %% ── Backend API ───────────────────────────────────────────────────────
+    subgraph BE["🐍  Backend  (FastAPI + Python 3.12)"]
+        direction TB
+        subgraph MW["Middleware Stack"]
+            RL["Rate Limit\nRedis Sliding Window"]
+            EX["Exception Handler\nStructured JSON Errors"]
+            CORS_MW["CORS Middleware"]
+        end
+        subgraph API["API Layer  /api/v1/"]
+            AUTH_R["auth/\nregister · login · refresh · logout"]
+            USER_R["users/\nprofile · avatar"]
+            WALLET_R["wallets/\nCRUD · credit · debit · transfer"]
+            RATE_R["exchange-rates/\nget · refresh"]
+            SSE_R["events/stream\nSSE endpoint"]
+            HEALTH_R["health · ready · live"]
+        end
+        subgraph SVC["Service Layer"]
+            AUTH_S["AuthService\nbcrypt · JWT"]
+            USER_S["UserService\nprofile · upload"]
+            WALLET_S["WalletService\nbalance · transfer · lock"]
+            RATE_S["ExchangeRateService\ncache chain · cross-rates"]
+        end
+        subgraph REPO["Repository Layer"]
+            USER_REPO["UserRepository"]
+            WALLET_REPO["WalletRepository\nSELECT FOR UPDATE"]
+            TXN_REPO["TransactionRepository"]
+            RATE_REPO["ExchangeRateRepository"]
+            IDEMP_REPO["IdempotencyRepository"]
+        end
+        subgraph ADAPT["Adapter Layer"]
+            CB["Circuit Breaker\nClosed → Open → Half-Open"]
+            MOCK_A["MockAdapter\n(dev/test)"]
+            OXR_A["OpenExchangeAdapter"]
+            FIXER_A["FixerAdapter"]
+        end
+        PUB["Event Publisher\npublish_wallet_event()"]
+    end
+
+    %% ── Data Stores ───────────────────────────────────────────────────────
+    subgraph DATA["🗄️  Data Stores"]
+        PG[("PostgreSQL 16\nusers · wallets · transactions\ntransfers · exchange_rates\nidempotency_keys · audit_logs")]
+        subgraph REDIS["Redis 7"]
+            R0[("DB 0\nCache\nExchange Rates\nUser Profiles")]
+            R1[("DB 1\nCelery Broker\nTask Queue")]
+            R2[("DB 2\nCelery Results")]
+            PUBSUB[("Pub/Sub\nwallet:events:{user_id}")]
+        end
+    end
+
+    %% ── Celery ────────────────────────────────────────────────────────────
+    subgraph CELERY["⚙️  Background Workers"]
+        WORKER["Celery Worker\ndefault · dead_letter queues"]
+        BEAT["Celery Beat\nHourly rate refresh"]
+        FLOWER["Flower Monitor\nPort 5555"]
+        subgraph TASKS["Tasks"]
+            T1["refresh_exchange_rates\n↻ exponential backoff × 3"]
+            T2["send_notification\n↻ exponential backoff × 5"]
+            T3["audit_log_task\n↻ retry × 3"]
+            DLQ["dead_letter_handler\nPermanently failed jobs"]
+        end
+    end
+
+    %% ── External APIs ─────────────────────────────────────────────────────
+    EXT_API["🌐  External APIs\nOpenExchangeRates.org\nFixer.io"]
+
+    %% ── Flow connections ──────────────────────────────────────────────────
+    USER -->|"HTTPS"| NGINX
+    NGINX -->|"Proxy /api/*"| BE
+    NGINX -->|"Serve dist/"| FE
+    USER -->|"EventSource\nGET /api/v1/events/stream"| SSE_CLIENT
+
+    FE --> AXIOS
+    FE --> REDUX
+    AXIOS -->|"REST calls"| NGINX
+    SSE_CLIENT -->|"SSE events\nwallet_update"| REDUX
+    REDUX --> PAGES
+
+    MW --> API
+    API --> SVC
+    SVC --> REPO
+    REPO -->|"Async SQL\nasyncpg"| PG
+    SVC --> ADAPT
+    ADAPT --> CB
+    CB -->|"closed"| OXR_A
+    CB -->|"closed"| FIXER_A
+    CB -->|"open → fallback"| R0
+    MOCK_A -.->|"dev/test only"| RATE_S
+
+    OXR_A -->|"HTTP"| EXT_API
+    FIXER_A -->|"HTTP"| EXT_API
+
+    WALLET_S -->|"after commit"| PUB
+    PUB -->|"PUBLISH"| PUBSUB
+    PUBSUB -->|"SSE stream"| SSE_R
+    SSE_R -->|"text/event-stream"| SSE_CLIENT
+
+    RATE_S -->|"get/set"| R0
+    BE -->|"enqueue tasks"| R1
+    R1 --> WORKER
+    WORKER --> TASKS
+    BEAT -->|"crontab"| T1
+    WORKER -->|"results"| R2
+    FLOWER -->|"monitor"| WORKER
+
+    %% ── Styling ───────────────────────────────────────────────────────────
+    classDef frontend fill:#DBEAFE,stroke:#1E40AF,color:#1E3A8A
+    classDef backend fill:#F0FDF4,stroke:#166534,color:#14532D
+    classDef database fill:#FEF3C7,stroke:#92400E,color:#78350F
+    classDef celery fill:#F3E8FF,stroke:#6B21A8,color:#581C87
+    classDef external fill:#F1F5F9,stroke:#475569,color:#1E293B
+    classDef nginx fill:#FFF7ED,stroke:#C2410C,color:#7C2D12
+
+    class FE,PAGES,REDUX,AXIOS,SSE_CLIENT frontend
+    class BE,MW,API,SVC,REPO,ADAPT,AUTH_R,USER_R,WALLET_R,RATE_R,SSE_R,HEALTH_R,AUTH_S,USER_S,WALLET_S,RATE_S,USER_REPO,WALLET_REPO,TXN_REPO,RATE_REPO,IDEMP_REPO,CB,MOCK_A,OXR_A,FIXER_A,PUB,RL,EX,CORS_MW backend
+    class DATA,PG,REDIS,R0,R1,R2,PUBSUB database
+    class CELERY,WORKER,BEAT,FLOWER,TASKS,T1,T2,T3,DLQ celery
+    class EXT_API external
+    class NGINX nginx
