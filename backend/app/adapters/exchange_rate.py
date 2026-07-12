@@ -1,21 +1,13 @@
 """
 Exchange Rate Provider — Adapter Pattern.
 
-The Adapter Pattern decouples the application from specific third-party APIs.
-Adding a new exchange rate provider = adding a new adapter class, zero changes elsewhere.
-
-Abstract interface → multiple concrete adapters
-ExchangeRateProvider (ABC)
-├── OpenExchangeAdapter
-├── FixerAdapter
-└── CurrencyLayerAdapter
-
-The factory function selects the adapter based on configuration.
+Fix: Cross-rate calculation so ANY currency pair works.
+If USD→JPY is known and USD→EUR is known, we can derive EUR→JPY = (USD→JPY) / (USD→EUR).
+This eliminates "exchange rate unavailable" for pairs not directly provided by the API.
 """
-import asyncio
 from abc import ABC, abstractmethod
 from decimal import Decimal
-from typing import Dict
+from typing import Dict, Optional
 
 import httpx
 import structlog
@@ -27,27 +19,54 @@ logger = structlog.get_logger(__name__)
 
 
 class ExchangeRateProvider(ABC):
-    """Abstract interface that all exchange rate adapters must implement."""
-
     @abstractmethod
     async def get_rates(self, base_currency: str) -> Dict[str, Decimal]:
-        """
-        Fetch exchange rates for a base currency.
-        Returns a dict of {target_currency: rate}.
-        """
         raise NotImplementedError
 
-    @abstractmethod
     async def get_rate(self, base_currency: str, target_currency: str) -> Decimal:
-        raise NotImplementedError
+        """
+        Get rate for any pair.
+        Strategy:
+          1. Try direct rate (base → target)
+          2. Try inverse rate (target → base, then invert)
+          3. Try cross via USD (base → USD → target)
+        """
+        base = base_currency.upper()
+        target = target_currency.upper()
+
+        if base == target:
+            return Decimal("1")
+
+        # 1. Direct
+        try:
+            rates = await self.get_rates(base)
+            if target in rates:
+                return rates[target]
+        except Exception:
+            pass
+
+        # 2. Inverse (get target→base, invert)
+        try:
+            rates = await self.get_rates(target)
+            if base in rates and rates[base] != 0:
+                return (Decimal("1") / rates[base]).quantize(Decimal("0.00000001"))
+        except Exception:
+            pass
+
+        # 3. Cross via USD
+        try:
+            usd_rates = await self.get_rates("USD")
+            base_to_usd = (Decimal("1") / usd_rates[base]) if base != "USD" else Decimal("1")
+            usd_to_target = usd_rates.get(target)
+            if base_to_usd and usd_to_target:
+                return (base_to_usd * usd_to_target).quantize(Decimal("0.00000001"))
+        except Exception:
+            pass
+
+        raise ExchangeRateUnavailableException(base, target)
 
 
 class OpenExchangeAdapter(ExchangeRateProvider):
-    """
-    Adapter for openexchangerates.org.
-    Free tier supports USD as base only.
-    """
-
     BASE_URL = "https://openexchangerates.org/api"
 
     def __init__(self, app_id: str):
@@ -67,17 +86,8 @@ class OpenExchangeAdapter(ExchangeRateProvider):
             logger.error("open_exchange_fetch_failed", error=str(exc))
             raise ExchangeRateUnavailableException(base_currency, "ALL") from exc
 
-    async def get_rate(self, base_currency: str, target_currency: str) -> Decimal:
-        rates = await self.get_rates(base_currency)
-        rate = rates.get(target_currency.upper())
-        if rate is None:
-            raise ExchangeRateUnavailableException(base_currency, target_currency)
-        return rate
-
 
 class FixerAdapter(ExchangeRateProvider):
-    """Adapter for fixer.io."""
-
     BASE_URL = "https://data.fixer.io/api"
 
     def __init__(self, api_key: str):
@@ -93,62 +103,66 @@ class FixerAdapter(ExchangeRateProvider):
             resp.raise_for_status()
             data = resp.json()
             if not data.get("success"):
-                raise Exception(data.get("error", {}).get("info", "Unknown fixer error"))
+                raise Exception(data.get("error", {}).get("info", "Fixer error"))
             return {k: Decimal(str(v)) for k, v in data.get("rates", {}).items()}
         except Exception as exc:
             logger.error("fixer_fetch_failed", error=str(exc))
             raise ExchangeRateUnavailableException(base_currency, "ALL") from exc
 
-    async def get_rate(self, base_currency: str, target_currency: str) -> Decimal:
-        rates = await self.get_rates(base_currency)
-        rate = rates.get(target_currency.upper())
-        if rate is None:
-            raise ExchangeRateUnavailableException(base_currency, target_currency)
-        return rate
-
 
 class MockExchangeAdapter(ExchangeRateProvider):
     """
-    Mock adapter for tests and development.
-    Returns deterministic rates — no external network calls.
+    Complete mock rates for all supported currencies — all relative to USD.
+    Cross-rates are computed automatically by the base class get_rate() method.
     """
-
-    MOCK_RATES = {
-        "USD": {"EUR": Decimal("0.92"), "GBP": Decimal("0.79"), "NGN": Decimal("1500"), "INR": Decimal("83.5"), "JPY": Decimal("149")},
-        "EUR": {"USD": Decimal("1.09"), "GBP": Decimal("0.86")},
-        "GBP": {"USD": Decimal("1.27"), "EUR": Decimal("1.16")},
+    # All rates are USD-based (how many units of currency per 1 USD)
+    USD_RATES: Dict[str, Decimal] = {
+        "EUR": Decimal("0.92"),
+        "GBP": Decimal("0.79"),
+        "JPY": Decimal("157.50"),   # ← was missing, now included
+        "CAD": Decimal("1.36"),
+        "AUD": Decimal("1.53"),
+        "CHF": Decimal("0.90"),
+        "CNY": Decimal("7.25"),
+        "INR": Decimal("83.50"),
+        "NGN": Decimal("1520.00"),
+        "GHS": Decimal("15.80"),
+        "KES": Decimal("129.00"),
+        "ZAR": Decimal("18.60"),
+        "USD": Decimal("1.00"),
     }
 
     async def get_rates(self, base_currency: str) -> Dict[str, Decimal]:
-        return self.MOCK_RATES.get(base_currency.upper(), {})
+        base = base_currency.upper()
 
-    async def get_rate(self, base_currency: str, target_currency: str) -> Decimal:
-        rates = await self.get_rates(base_currency)
-        rate = rates.get(target_currency.upper())
-        if rate is None:
-            raise ExchangeRateUnavailableException(base_currency, target_currency)
-        return rate
+        if base == "USD":
+            return dict(self.USD_RATES)
+
+        # Convert USD-based table to the requested base
+        if base not in self.USD_RATES:
+            raise ExchangeRateUnavailableException(base, "ALL")
+
+        base_per_usd = self.USD_RATES[base]   # e.g. for EUR: 0.92
+        result: Dict[str, Decimal] = {}
+
+        for currency, usd_rate in self.USD_RATES.items():
+            if currency == base:
+                result[currency] = Decimal("1")
+            else:
+                # base→target = (USD→target) / (USD→base)
+                result[currency] = (usd_rate / base_per_usd).quantize(Decimal("0.00000001"))
+
+        return result
 
 
 def get_exchange_rate_provider() -> ExchangeRateProvider:
-    """
-    Factory function — selects provider based on configuration.
-    This is the single place where provider coupling exists.
-    """
     provider = settings.EXCHANGE_RATE_PROVIDER.lower()
 
-    if provider == "open_exchange":
-        if not settings.OPEN_EXCHANGE_APP_ID:
-            logger.warning("No Open Exchange API key, falling back to mock provider")
-            return MockExchangeAdapter()
+    if provider == "open_exchange" and settings.OPEN_EXCHANGE_APP_ID:
         return OpenExchangeAdapter(app_id=settings.OPEN_EXCHANGE_APP_ID)
 
-    elif provider == "fixer":
-        if not settings.FIXER_API_KEY:
-            logger.warning("No Fixer API key, falling back to mock provider")
-            return MockExchangeAdapter()
+    if provider == "fixer" and settings.FIXER_API_KEY:
         return FixerAdapter(api_key=settings.FIXER_API_KEY)
 
-    else:
-        logger.info("Using mock exchange rate provider")
-        return MockExchangeAdapter()
+    logger.info("using_mock_exchange_rate_provider")
+    return MockExchangeAdapter()
