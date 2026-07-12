@@ -1,0 +1,158 @@
+version: "3.9"
+
+# ── Production Docker Compose ─────────────────────────────────────────────────
+# Images are pulled from ECR (not built locally).
+# All secrets come from environment variables injected at deploy time.
+# Run on the EC2 host via:
+#   docker compose -f docker-compose.prod.yml up -d
+
+services:
+  # ── PostgreSQL ───────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: wallet_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - wallet_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB} -q"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+      start_period: 15s
+
+  # ── Redis ────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: wallet_redis
+    restart: unless-stopped
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru --appendonly no
+    volumes:
+      - redis_data:/data
+    networks:
+      - wallet_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # ── FastAPI Backend ──────────────────────────────────────────────────────────
+  backend:
+    image: ${ECR_REGISTRY}/${ECR_BACKEND_REPO}:${IMAGE_TAG}
+    container_name: wallet_backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      ENVIRONMENT: production
+      DEBUG: "false"
+      EXCHANGE_RATE_PROVIDER: ${EXCHANGE_RATE_PROVIDER:-mock}
+      OPEN_EXCHANGE_APP_ID: ${OPEN_EXCHANGE_APP_ID:-}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
+      UPLOAD_DIR: /tmp/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - upload_data:/tmp/uploads
+    networks:
+      - wallet_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/api/v1/health > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ── Celery Worker ────────────────────────────────────────────────────────────
+  celery_worker:
+    image: ${ECR_REGISTRY}/${ECR_BACKEND_REPO}:${IMAGE_TAG}
+    container_name: wallet_celery_worker
+    restart: unless-stopped
+    command: celery -A app.workers.celery_app worker --loglevel=info --queues=default,dead_letter --concurrency=2
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      ENVIRONMENT: production
+      EXCHANGE_RATE_PROVIDER: ${EXCHANGE_RATE_PROVIDER:-mock}
+      OPEN_EXCHANGE_APP_ID: ${OPEN_EXCHANGE_APP_ID:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - wallet_net
+
+  # ── Celery Beat ──────────────────────────────────────────────────────────────
+  celery_beat:
+    image: ${ECR_REGISTRY}/${ECR_BACKEND_REPO}:${IMAGE_TAG}
+    container_name: wallet_celery_beat
+    restart: unless-stopped
+    command: celery -A app.workers.celery_app beat --loglevel=info -s /tmp/celerybeat-schedule
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      ENVIRONMENT: production
+      EXCHANGE_RATE_PROVIDER: ${EXCHANGE_RATE_PROVIDER:-mock}
+      OPEN_EXCHANGE_APP_ID: ${OPEN_EXCHANGE_APP_ID:-}
+    depends_on:
+      - celery_worker
+    networks:
+      - wallet_net
+
+  # ── Flower ───────────────────────────────────────────────────────────────────
+  flower:
+    image: mher/flower:2.0
+    container_name: wallet_flower
+    restart: unless-stopped
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/1
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+    networks:
+      - wallet_net
+
+  # ── React Frontend (Nginx) ───────────────────────────────────────────────────
+  frontend:
+    image: ${ECR_REGISTRY}/${ECR_FRONTEND_REPO}:${IMAGE_TAG}
+    container_name: wallet_frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - wallet_net
+
+volumes:
+  postgres_data:
+  redis_data:
+  upload_data:
+
+networks:
+  wallet_net:
+    driver: bridge
